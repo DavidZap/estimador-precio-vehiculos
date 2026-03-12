@@ -81,6 +81,30 @@ def _load_model_sidecar(artifact_path: str) -> dict[str, Any]:
         return {}
 
 
+def _coerce_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    return {}
+
+
+def _coerce_string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if item not in (None, "")]
+
+
+def _coerce_list_of_dicts(value: Any) -> list[dict[str, Any]] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        return None
+    cleaned: list[dict[str, Any]] = []
+    for item in value:
+        if isinstance(item, dict):
+            cleaned.append(item)
+    return cleaned
+
+
 def _get_scope_candidates(db: Session, scope: str) -> list[ModelRegistryModel]:
     rows = db.query(ModelRegistryModel).order_by(ModelRegistryModel.created_at.desc()).all()
     return [
@@ -121,23 +145,34 @@ def get_active_serving_models(db: Session) -> list[dict[str, Any]]:
         if not row.is_active:
             continue
         seen_scopes.add(scope)
-        sidecar = _load_model_sidecar(row.artifact_path)
-        payload.append(
-            {
-                "registry_id": str(row.id),
-                "model_name": row.model_name,
-                "model_version": row.model_version,
-                "algorithm": row.algorithm,
-                "model_scope": scope,
-                "status": row.status,
-                "is_active": row.is_active,
-                "promoted_at": row.promoted_at,
-                "metrics": row.metrics_json or {},
-                "scope_filters": row.scope_filters_json or (row.feature_schema_json or {}),
-                "selected_features": row.selected_features_json or sidecar.get("selected_feature_names", []),
-                "shap_summary": row.shap_summary_json or sidecar.get("shap_summary"),
-            }
-        )
+        try:
+            sidecar = _load_model_sidecar(row.artifact_path)
+            payload.append(
+                {
+                    "registry_id": str(row.id),
+                    "model_name": row.model_name,
+                    "model_version": row.model_version,
+                    "algorithm": row.algorithm,
+                    "model_scope": scope,
+                    "status": row.status or "ready",
+                    "is_active": bool(row.is_active),
+                    "metrics": _coerce_dict(row.metrics_json),
+                    "scope_filters": _coerce_dict(row.scope_filters_json or row.feature_schema_json),
+                    "selected_features": _coerce_string_list(
+                        row.selected_features_json or sidecar.get("selected_feature_names", [])
+                    ),
+                    "shap_summary": _coerce_list_of_dicts(
+                        row.shap_summary_json or sidecar.get("shap_summary")
+                    ),
+                }
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "No fue posible serializar el modelo activo %s (%s): %s",
+                row.model_name,
+                row.id,
+                exc,
+            )
     return payload
 
 

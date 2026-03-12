@@ -333,6 +333,13 @@ La Fase 6 agrega una capa de serving con doble modelo:
 - `global`: fallback para cualquier marca con cobertura limitada
 - `mainstream`: preferido para `Toyota`, `Mazda`, `Renault`, `Chevrolet`, `Volkswagen`
 
+Importante:
+
+- las predicciones `mainstream` son hoy las mas fuertes del sistema
+- las predicciones para marcas no mainstream dependen del modelo `global`
+- ese fallback sigue siendo util para estimacion inicial, pero actualmente tiene menor precision, menor robustez segmental y debe interpretarse con mayor cautela
+- para vehiculos no mainstream, la recomendacion es usar la prediccion como referencia preliminar y apoyarla con comparables observables y criterio humano
+
 El router de prediccion usa la marca para decidir el scope solicitado y luego:
 
 1. intenta usar el modelo activo del scope correcto
@@ -385,6 +392,33 @@ La respuesta incluye:
 - modelo usado y scope efectivo
 - comparables
 - explicacion SHAP local si el modelo lo soporta
+- una lectura mas cauta cuando la prediccion cae en el modelo global para marcas no mainstream
+
+## Frontend MVP en Streamlit
+
+La Fase 7 incorpora un frontend MVP en Streamlit con dos modulos:
+
+- explorador de mercado
+- estimador de precio
+
+Ejecutar:
+
+```powershell
+streamlit run src/vehicle_price_estimator/frontend/streamlit_app/Home.py
+```
+
+Por defecto intenta conectarse a:
+
+```text
+http://localhost:8000/api/v1
+```
+
+Recomendacion operativa:
+
+1. inicia la API con `uvicorn`
+2. inicia Streamlit en otra terminal
+3. usa el explorador para revisar inventario y el estimador para predicciones puntuales
+4. para marcas no mainstream, interpreta la salida como referencia inicial de mercado y no como estimacion de alta confianza
 
 ## Nota sobre Supabase
 

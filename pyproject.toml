@@ -28,6 +28,7 @@ dependencies = [
   "scikit-learn>=1.6.1",
   "shap>=0.46.0",
   "sqlalchemy>=2.0.36",
+  "streamlit>=1.44.0",
   "uvicorn[standard]>=0.34.0",
   "xgboost>=2.1.4"
 ]
