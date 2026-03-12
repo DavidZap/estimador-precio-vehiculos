@@ -1,0 +1,516 @@
+from __future__ import annotations
+
+import json
+import uuid
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import ElasticNet
+from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error, mean_squared_error, r2_score
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+from vehicle_price_estimator.config.logging import get_logger
+from vehicle_price_estimator.config.settings import get_settings
+from vehicle_price_estimator.infrastructure.db.models.model_registry import ModelRegistryModel
+from vehicle_price_estimator.infrastructure.db.models.pipeline_run import PipelineRunModel
+from vehicle_price_estimator.infrastructure.db.session import SessionLocal
+from vehicle_price_estimator.infrastructure.ml.features.dataset_builder import (
+    CATEGORICAL_FEATURES,
+    IDENTIFIER_COLUMNS,
+    NUMERIC_FEATURES,
+    TARGET_COLUMN,
+    TrainingDataset,
+    build_training_dataset,
+)
+
+
+LOGGER = get_logger(__name__)
+
+
+@dataclass(slots=True)
+class ModelCandidateResult:
+    model_name: str
+    algorithm: str
+    model_version: str
+    metrics: dict[str, float]
+    params: dict
+    artifact_path: Path
+    dataset_id: uuid.UUID
+    feature_schema: dict
+    trained_at: datetime
+
+
+def _build_preprocessor() -> ColumnTransformer:
+    numeric_transformer = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+        ]
+    )
+    categorical_transformer = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("encoder", OneHotEncoder(handle_unknown="ignore")),
+        ]
+    )
+
+    return ColumnTransformer(
+        transformers=[
+            ("num", numeric_transformer, NUMERIC_FEATURES),
+            ("cat", categorical_transformer, CATEGORICAL_FEATURES),
+        ]
+    )
+
+
+def _build_dense_preprocessor() -> ColumnTransformer:
+    numeric_transformer = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+        ]
+    )
+    categorical_transformer = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+        ]
+    )
+
+    return ColumnTransformer(
+        transformers=[
+            ("num", numeric_transformer, NUMERIC_FEATURES),
+            ("cat", categorical_transformer, CATEGORICAL_FEATURES),
+        ]
+    )
+
+
+def _split_dataset(dataset: TrainingDataset) -> tuple[pd.DataFrame, pd.DataFrame]:
+    dataframe = dataset.dataframe.copy()
+    dataframe = dataframe.sort_values(["first_seen_at", "updated_at"], na_position="last")
+    split_index = max(int(len(dataframe) * 0.8), 1)
+    if split_index >= len(dataframe):
+        split_index = len(dataframe) - 1
+    if split_index <= 0:
+        raise ValueError("No hay suficientes filas para separar train/test.")
+    return dataframe.iloc[:split_index].copy(), dataframe.iloc[split_index:].copy()
+
+
+def _prepare_xy(dataframe: pd.DataFrame) -> tuple[pd.DataFrame, np.ndarray]:
+    feature_columns = [*NUMERIC_FEATURES, *CATEGORICAL_FEATURES]
+    X = dataframe[feature_columns].copy()
+    y = np.log1p(dataframe[TARGET_COLUMN].astype(float).to_numpy())
+    return X, y
+
+
+def _evaluate_predictions(y_true_log: np.ndarray, y_pred_log: np.ndarray) -> dict[str, float]:
+    y_true = np.expm1(y_true_log)
+    y_pred = np.expm1(y_pred_log)
+    mae = float(mean_absolute_error(y_true, y_pred))
+    rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
+    mape = float(mean_absolute_percentage_error(y_true, y_pred))
+    r2 = float(r2_score(y_true, y_pred))
+    return {
+        "mae": round(mae, 4),
+        "rmse": round(rmse, 4),
+        "mape": round(mape, 6),
+        "r2": round(r2, 6),
+    }
+
+
+def _optional_model_candidates() -> list[tuple[str, str, object, dict]]:
+    candidates: list[tuple[str, str, object, dict]] = []
+
+    try:
+        from catboost import CatBoostRegressor
+
+        candidates.append(
+            (
+                "market_price_catboost",
+                "catboost",
+                CatBoostRegressor(
+                    depth=8,
+                    iterations=500,
+                    learning_rate=0.05,
+                    loss_function="RMSE",
+                    verbose=False,
+                    random_seed=42,
+                ),
+                {
+                    "depth": 8,
+                    "iterations": 500,
+                    "learning_rate": 0.05,
+                    "loss_function": "RMSE",
+                },
+            )
+        )
+    except ImportError:
+        LOGGER.warning("CatBoost no está instalado; se omite ese candidato.")
+
+    try:
+        from lightgbm import LGBMRegressor
+
+        candidates.append(
+            (
+                "market_price_lightgbm",
+                "lightgbm",
+                Pipeline(
+                    steps=[
+                        ("preprocessor", _build_dense_preprocessor()),
+                        (
+                            "model",
+                            LGBMRegressor(
+                                n_estimators=500,
+                                learning_rate=0.05,
+                                num_leaves=31,
+                                random_state=42,
+                            ),
+                        ),
+                    ]
+                ),
+                {
+                    "n_estimators": 500,
+                    "learning_rate": 0.05,
+                    "num_leaves": 31,
+                },
+            )
+        )
+    except ImportError:
+        LOGGER.warning("LightGBM no está instalado; se omite ese candidato.")
+
+    try:
+        from xgboost import XGBRegressor
+
+        candidates.append(
+            (
+                "market_price_xgboost",
+                "xgboost",
+                Pipeline(
+                    steps=[
+                        ("preprocessor", _build_dense_preprocessor()),
+                        (
+                            "model",
+                            XGBRegressor(
+                                n_estimators=400,
+                                learning_rate=0.05,
+                                max_depth=8,
+                                subsample=0.9,
+                                colsample_bytree=0.9,
+                                objective="reg:squarederror",
+                                random_state=42,
+                            ),
+                        ),
+                    ]
+                ),
+                {
+                    "n_estimators": 400,
+                    "learning_rate": 0.05,
+                    "max_depth": 8,
+                    "subsample": 0.9,
+                    "colsample_bytree": 0.9,
+                },
+            )
+        )
+    except ImportError:
+        LOGGER.warning("XGBoost no está instalado; se omite ese candidato.")
+
+    return candidates
+
+
+def _baseline_candidates() -> list[tuple[str, str, object, dict]]:
+    return [
+        (
+            "market_price_elasticnet",
+            "elasticnet",
+            Pipeline(
+                steps=[
+                    ("preprocessor", _build_preprocessor()),
+                    ("model", ElasticNet(alpha=0.0008, l1_ratio=0.15, random_state=42, max_iter=5000)),
+                ]
+            ),
+            {"alpha": 0.0008, "l1_ratio": 0.15, "max_iter": 5000},
+        ),
+        (
+            "market_price_random_forest",
+            "random_forest",
+            Pipeline(
+                steps=[
+                    ("preprocessor", _build_dense_preprocessor()),
+                    (
+                        "model",
+                        RandomForestRegressor(
+                            n_estimators=300,
+                            max_depth=18,
+                            min_samples_leaf=2,
+                            random_state=42,
+                            n_jobs=-1,
+                        ),
+                    ),
+                ]
+            ),
+            {"n_estimators": 300, "max_depth": 18, "min_samples_leaf": 2},
+        ),
+        (
+            "market_price_hist_gradient_boosting",
+            "hist_gradient_boosting",
+            Pipeline(
+                steps=[
+                    ("preprocessor", _build_dense_preprocessor()),
+                    (
+                        "model",
+                        HistGradientBoostingRegressor(
+                            learning_rate=0.05,
+                            max_depth=10,
+                            max_iter=500,
+                            random_state=42,
+                        ),
+                    ),
+                ]
+            ),
+            {"learning_rate": 0.05, "max_depth": 10, "max_iter": 500},
+        ),
+    ]
+
+
+def _fit_candidate(model_name: str, algorithm: str, estimator, params: dict, dataset: TrainingDataset) -> ModelCandidateResult:
+    train_df, test_df = _split_dataset(dataset)
+    X_train, y_train = _prepare_xy(train_df)
+    X_test, y_test = _prepare_xy(test_df)
+
+    if algorithm == "catboost":
+        X_train_cb = X_train.copy()
+        X_test_cb = X_test.copy()
+        categorical_features = [column for column in CATEGORICAL_FEATURES if column in X_train_cb.columns]
+        for column in categorical_features:
+            X_train_cb[column] = X_train_cb[column].fillna("__missing__").astype(str)
+            X_test_cb[column] = X_test_cb[column].fillna("__missing__").astype(str)
+        for column in NUMERIC_FEATURES:
+            X_train_cb[column] = pd.to_numeric(X_train_cb[column], errors="coerce")
+            X_test_cb[column] = pd.to_numeric(X_test_cb[column], errors="coerce")
+        estimator.fit(X_train_cb, y_train, cat_features=categorical_features)
+        predictions = estimator.predict(X_test_cb)
+    else:
+        estimator.fit(X_train, y_train)
+        predictions = estimator.predict(X_test)
+
+    metrics = _evaluate_predictions(y_test, predictions)
+
+    settings = get_settings()
+    model_version = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+    model_dir = settings.artifacts_path / "training" / "models" / model_name / model_version
+    model_dir.mkdir(parents=True, exist_ok=True)
+    artifact_path = model_dir / "model.joblib"
+    metadata_path = model_dir / "metadata.json"
+
+    joblib.dump(
+        {
+            "estimator": estimator,
+            "algorithm": algorithm,
+            "model_name": model_name,
+            "model_version": model_version,
+            "numeric_features": NUMERIC_FEATURES,
+            "categorical_features": CATEGORICAL_FEATURES,
+            "target_column": TARGET_COLUMN,
+            "dataset_id": str(dataset.dataset_id),
+        },
+        artifact_path,
+    )
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "model_name": model_name,
+                "algorithm": algorithm,
+                "model_version": model_version,
+                "params": params,
+                "metrics": metrics,
+                "dataset_id": str(dataset.dataset_id),
+                "trained_at": datetime.now(UTC).isoformat(),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    return ModelCandidateResult(
+        model_name=model_name,
+        algorithm=algorithm,
+        model_version=model_version,
+        metrics=metrics,
+        params=params,
+        artifact_path=artifact_path,
+        dataset_id=dataset.dataset_id,
+        feature_schema=dataset.feature_schema,
+        trained_at=datetime.now(UTC),
+    )
+
+
+def _register_candidate(result: ModelCandidateResult) -> uuid.UUID:
+    with SessionLocal() as db:
+        registry_row = ModelRegistryModel(
+            model_name=result.model_name,
+            model_version=result.model_version,
+            algorithm=result.algorithm,
+            dataset_id=result.dataset_id,
+            artifact_path=str(result.artifact_path),
+            metrics_json=result.metrics,
+            params_json=result.params,
+            feature_schema_json=result.feature_schema,
+            status="trained",
+            is_active=False,
+        )
+        db.add(registry_row)
+        db.commit()
+        db.refresh(registry_row)
+        return registry_row.id
+
+
+def _promote_if_better(result: ModelCandidateResult, registry_id: uuid.UUID) -> bool:
+    with SessionLocal() as db:
+        active_model = (
+            db.query(ModelRegistryModel)
+            .filter(ModelRegistryModel.is_active.is_(True))
+            .order_by(ModelRegistryModel.created_at.desc())
+            .first()
+        )
+
+        should_promote = active_model is None
+        if active_model is not None:
+            active_mae = float((active_model.metrics_json or {}).get("mae", float("inf")))
+            should_promote = result.metrics["mae"] < active_mae
+
+        if not should_promote:
+            return False
+
+        if active_model is not None:
+            active_model.is_active = False
+            active_model.status = "archived"
+
+        candidate_row = db.query(ModelRegistryModel).filter(ModelRegistryModel.id == registry_id).one()
+        candidate_row.is_active = True
+        candidate_row.status = "promoted"
+        candidate_row.promoted_at = datetime.now(UTC)
+        db.commit()
+        return True
+
+
+def run_training_pipeline(
+    *,
+    min_year: int = 2010,
+    exclude_outliers: bool = True,
+    active_only: bool = True,
+) -> dict:
+    started_at = datetime.now(UTC)
+    with SessionLocal() as db:
+        pipeline_run = PipelineRunModel(
+            pipeline_name="training_pipeline_v0_1",
+            status="running",
+            context_json={
+                "min_year": min_year,
+                "exclude_outliers": exclude_outliers,
+                "active_only": active_only,
+            },
+            started_at=started_at,
+        )
+        db.add(pipeline_run)
+        db.commit()
+        db.refresh(pipeline_run)
+        pipeline_run_id = pipeline_run.id
+
+    try:
+        dataset = build_training_dataset(
+            min_year=min_year,
+            exclude_outliers=exclude_outliers,
+            active_only=active_only,
+        )
+
+        candidates = _baseline_candidates()
+        candidates.extend(_optional_model_candidates())
+        if not candidates:
+            raise ValueError("No hay candidatos de entrenamiento disponibles.")
+
+        results: list[tuple[uuid.UUID, ModelCandidateResult]] = []
+        for model_name, algorithm, estimator, params in candidates:
+            result = _fit_candidate(model_name, algorithm, estimator, params, dataset)
+            registry_id = _register_candidate(result)
+            results.append((registry_id, result))
+
+        best_registry_id, best_result = sorted(
+            results,
+            key=lambda item: (item[1].metrics["mae"], item[1].metrics["rmse"]),
+        )[0]
+        promoted = _promote_if_better(best_result, best_registry_id)
+
+        summary = {
+            "dataset_id": str(dataset.dataset_id),
+            "dataset_path": str(dataset.dataset_path),
+            "row_count": int(len(dataset.dataframe)),
+            "candidate_count": len(results),
+            "best_model_name": best_result.model_name,
+            "best_algorithm": best_result.algorithm,
+            "best_metrics": best_result.metrics,
+            "promoted": promoted,
+            "candidates": [
+                {
+                    "registry_id": str(registry_id),
+                    "model_name": result.model_name,
+                    "algorithm": result.algorithm,
+                    "metrics": result.metrics,
+                }
+                for registry_id, result in results
+            ],
+        }
+
+        with SessionLocal() as db:
+            pipeline_run = db.query(PipelineRunModel).filter(PipelineRunModel.id == pipeline_run_id).one()
+            pipeline_run.status = "completed"
+            pipeline_run.metrics_json = summary
+            pipeline_run.finished_at = datetime.now(UTC)
+            db.commit()
+
+        return summary
+    except Exception as exc:
+        with SessionLocal() as db:
+            pipeline_run = db.query(PipelineRunModel).filter(PipelineRunModel.id == pipeline_run_id).one()
+            pipeline_run.status = "failed"
+            pipeline_run.error_json = {"error": str(exc), "error_type": type(exc).__name__}
+            pipeline_run.finished_at = datetime.now(UTC)
+            db.commit()
+        raise
+
+
+def promote_model(registry_id: uuid.UUID) -> bool:
+    with SessionLocal() as db:
+        candidate = db.query(ModelRegistryModel).filter(ModelRegistryModel.id == registry_id).one_or_none()
+        if candidate is None:
+            raise ValueError(f"No existe modelo con id {registry_id}")
+
+        active_model = (
+            db.query(ModelRegistryModel)
+            .filter(ModelRegistryModel.is_active.is_(True))
+            .order_by(ModelRegistryModel.created_at.desc())
+            .first()
+        )
+
+        if active_model is not None and active_model.id == candidate.id:
+            return True
+
+        candidate_mae = float((candidate.metrics_json or {}).get("mae", float("inf")))
+        active_mae = float((active_model.metrics_json or {}).get("mae", float("inf"))) if active_model else float("inf")
+        if active_model is not None and candidate_mae >= active_mae:
+            return False
+
+        if active_model is not None:
+            active_model.is_active = False
+            active_model.status = "archived"
+
+        candidate.is_active = True
+        candidate.status = "promoted"
+        candidate.promoted_at = datetime.now(UTC)
+        db.commit()
+        return True

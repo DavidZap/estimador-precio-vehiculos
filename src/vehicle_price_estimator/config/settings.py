@@ -42,6 +42,10 @@ class Settings(BaseSettings):
         alias="MERCADOLIBRE_BROWSER_HEADLESS",
     )
     mercadolibre_browser_wait_ms: int = Field(default=8000, alias="MERCADOLIBRE_BROWSER_WAIT_MS")
+    colombia_geo_source_url: str = Field(
+        default="https://www.datos.gov.co/api/views/gdxc-w37w/rows.json?accessType=DOWNLOAD",
+        alias="COLOMBIA_GEO_SOURCE_URL",
+    )
     raw_storage_path: Path = Field(default=Path("./data/raw"), alias="RAW_STORAGE_PATH")
     artifacts_path: Path = Field(default=Path("./data/artifacts"), alias="ARTIFACTS_PATH")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")

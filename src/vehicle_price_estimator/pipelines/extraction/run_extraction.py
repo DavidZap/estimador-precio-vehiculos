@@ -48,7 +48,7 @@ def run_extraction_pipeline(
     query: str = "vehiculos usados colombia",
     limit: int | None = None,
     fetch_item_details: bool = True,
-) -> None:
+) -> str:
     settings = get_settings()
     configure_logging(settings.log_level)
     connector = MercadoLibreConnector()
@@ -117,3 +117,4 @@ def run_extraction_pipeline(
         len(payloads),
         batch.strategy,
     )
+    return str(extract_run.id)

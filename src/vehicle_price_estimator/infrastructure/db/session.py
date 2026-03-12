@@ -4,6 +4,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from vehicle_price_estimator.config.settings import get_settings
+from vehicle_price_estimator.infrastructure.db import models  # noqa: F401
 
 
 settings = get_settings()

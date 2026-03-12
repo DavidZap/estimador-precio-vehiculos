@@ -104,12 +104,21 @@ uvicorn vehicle_price_estimator.api.main:app --reload
 - `GET /health`
 - `GET /api/v1/health/db`
 - `GET /api/v1/meta/settings`
+- `GET /api/v1/market/listings`
+- `GET /api/v1/market/filters`
+- `GET /api/v1/market/summary`
+- `GET /api/v1/market/distribution`
+- `GET /api/v1/market/comparables`
 
 ## Scripts disponibles
 
 - `python scripts/init_db.py`
 - `python scripts/check_db_connection.py`
 - `python scripts/extract_marketplace.py`
+- `python scripts/run_inventory_capture.py --dry-run`
+- `python scripts/run_inventory_capture.py --campaign discovery --brands toyota,mazda,chevrolet --regions bogota,medellin,cali`
+- `python scripts/train_models.py`
+- `python scripts/promote_model.py --registry-id TU_UUID`
 
 ## Extraccion inicial Mercado Libre Colombia
 
@@ -138,6 +147,166 @@ Opcional, para evitar pedir detalle por item:
 
 ```powershell
 python scripts/extract_marketplace.py --query "renault sandero" --limit 10 --no-details
+```
+
+## Procesamiento raw a staging
+
+Una vez tengas una corrida raw con `browser_search` o `web_search`, puedes generar la tabla staging:
+
+```powershell
+python scripts/process_raw_to_staging.py
+```
+
+Tambien puedes procesar una corrida especifica:
+
+```powershell
+python scripts/process_raw_to_staging.py --extract-run-id TU_EXTRACT_RUN_ID
+```
+
+El pipeline actual de staging parsea desde el HTML renderizado de busqueda:
+
+- `source_listing_id`
+- `source_url`
+- `title_raw`
+- `price_amount`
+- `location_raw`
+- `city_raw`
+- `state_raw`
+- `brand_raw`
+- `model_raw`
+- `version_raw`
+- `year_raw`
+- `mileage_raw`
+- `image_url`
+
+## Procesamiento staging a core
+
+El siguiente paso normaliza staging y construye entidades de negocio en `core`:
+
+```powershell
+python scripts/process_staging_to_processed.py
+```
+
+Tambien puedes procesar una corrida especifica:
+
+```powershell
+python scripts/process_staging_to_processed.py --extract-run-id TU_EXTRACT_RUN_ID
+```
+
+El pipeline actual crea o actualiza:
+
+- `core.vehicle_canonical`
+- `core.listings`
+- `core.listing_price_history`
+- `core.listing_status_history`
+- `core.listing_features`
+
+Incluye en esta primera version:
+
+- normalizacion basica de marca, modelo, version y ubicacion
+- deduplicacion por `source_name + source_listing_id`
+- historico de precios por observacion
+- historico de estado `active`
+- features iniciales:
+  - `vehicle_age`
+  - `km_per_year`
+  - `equipment_score`
+  - `version_rarity_score`
+  - `regional_market_score`
+  - `listing_age_days`
+  - `comparable_inventory_density`
+  - `outlier_flag` basico por IQR de segmento
+
+Refinamientos actuales de normalizacion en `core.listings` y `core.vehicle_canonical`:
+
+- `trim_std`
+- `engine_displacement_std`
+- `engine_cc`
+- `hybrid_flag`
+- `mhev_flag`
+- `variant_raw`
+- `marketing_tokens_json`
+
+Esto permite separar mejor:
+
+- `Touring`, `Grand Touring`, `Prime`, `Sport`, `LX` como trim
+- `2.0`, `1.6`, `2000cc` como motor
+- `AT`, `MT`, `Mecanico`, `Automatica` como transmision
+- `Hibrido` y `MHEV` como flags estructurados
+
+## Construccion de inventario amplio
+
+Antes del entrenamiento conviene ampliar el inventario con una campana nacional orientada a marcas, regiones y modelos descubiertos en Mercado Libre Colombia.
+
+Cobertura por defecto de la campana:
+
+- marcas: `Toyota`, `Mazda`, `Chevrolet`, `Volkswagen`, `Renault`, `BYD`, `Kia`, `Mercedes-Benz`, `BMW`, `Audi`, `Nissan`
+- hubs regionales: `Bogota`, `Medellin`, `Cali`, `Barranquilla`, `Cartagena`, `Bucaramanga`, `Cucuta`, `Pereira`, `Villavicencio`, `Pasto`
+- anos ancla para backfill: `2010`, `2014`, `2018`, `2022` y el ano actual
+
+Campanas disponibles:
+
+- `discovery`: consulta `marca + region` para descubrir modelos presentes en Mercado Libre
+- `model_region`: consulta `marca + modelo + region` usando modelos ya descubiertos en la base
+- `year_backfill`: consulta `marca + ano + region` para reforzar cobertura desde 2010
+- `full`: combina discovery, model_region y year_backfill
+
+Ejemplos:
+
+```powershell
+python scripts/run_inventory_capture.py --campaign discovery --dry-run
+```
+
+```powershell
+python scripts/run_inventory_capture.py --campaign discovery --brands toyota,mazda,chevrolet --regions bogota,medellin,cali --max-queries 12
+```
+
+```powershell
+python scripts/run_inventory_capture.py --campaign model_region --brands toyota,mazda --regions bogota,cali --max-models-per-brand 8
+```
+
+```powershell
+python scripts/run_inventory_capture.py --campaign year_backfill --brands renault,kia,nissan --regions bogota,medellin,cali --max-queries 20
+```
+
+Recomendacion operativa para presupuesto bajo:
+
+1. Ejecuta primero `discovery` por lotes pequenos.
+2. Revisa `/api/v1/market/filters` o `core.listings` para validar cobertura de marcas/modelos.
+3. Ejecuta `model_region` para profundizar marcas/modelos ya observados.
+4. Ejecuta `year_backfill` para reforzar cobertura 2010+ antes del entrenamiento.
+
+## Entrenamiento inicial
+
+La primera version de la Fase 5 ya entrena y compara varios candidatos sobre `core.listings` + `core.listing_features`.
+
+Incluye:
+
+- `ElasticNet` como baseline lineal
+- `RandomForestRegressor`
+- `HistGradientBoostingRegressor` como booster tabular liviano
+- `CatBoost`, `LightGBM` y `XGBoost` si estan instalados en el entorno
+
+El pipeline:
+
+1. construye un dataset reproducible en `data/artifacts/training/datasets`
+2. hace split temporal 80/20 usando `first_seen_at` y `updated_at`
+3. entrena candidatos con target `log1p(price_cop)`
+4. calcula `MAE`, `RMSE`, `MAPE` y `R2`
+5. registra cada candidato en `ml.model_registry`
+6. promueve automaticamente el mejor solo si mejora al modelo activo
+
+Ejecutar:
+
+```powershell
+python -m pip install -e .[dev]
+python scripts/train_models.py
+```
+
+Si quieres incluir outliers o anuncios inactivos:
+
+```powershell
+python scripts/train_models.py --include-outliers --include-inactive
 ```
 
 ## Nota sobre Supabase
