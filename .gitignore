@@ -20,3 +20,4 @@ data/artifacts/*
 !data/staging/.gitkeep
 !data/processed/.gitkeep
 !data/artifacts/.gitkeep
+catboost_info/

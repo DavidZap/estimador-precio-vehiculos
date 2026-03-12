@@ -10,6 +10,7 @@ from vehicle_price_estimator.infrastructure.db.models import listing_status_hist
 from vehicle_price_estimator.infrastructure.db.models import model_registry  # noqa: F401
 from vehicle_price_estimator.infrastructure.db.models import pipeline_run  # noqa: F401
 from vehicle_price_estimator.infrastructure.db.models import price_history  # noqa: F401
+from vehicle_price_estimator.infrastructure.db.models import prediction_log  # noqa: F401
 from vehicle_price_estimator.infrastructure.db.models import raw_listing_payload  # noqa: F401
 from vehicle_price_estimator.infrastructure.db.models import raw_run  # noqa: F401
 from vehicle_price_estimator.infrastructure.db.models import staging_listing  # noqa: F401
@@ -40,6 +41,13 @@ DDL_STATEMENTS = [
     "ALTER TABLE core.listings ADD COLUMN IF NOT EXISTS municipality_code VARCHAR(10)",
     "ALTER TABLE core.listings ADD COLUMN IF NOT EXISTS latitude NUMERIC(12,8)",
     "ALTER TABLE core.listings ADD COLUMN IF NOT EXISTS longitude NUMERIC(12,8)",
+    "ALTER TABLE core.listing_features ADD COLUMN IF NOT EXISTS vehicle_age_bucket VARCHAR(40)",
+    "ALTER TABLE core.listing_features ADD COLUMN IF NOT EXISTS technomechanical_required_flag BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE core.listing_features ADD COLUMN IF NOT EXISTS years_since_technomechanical_threshold NUMERIC(6,2)",
+    "ALTER TABLE ml.model_registry ADD COLUMN IF NOT EXISTS selected_features_json JSONB",
+    "ALTER TABLE ml.model_registry ADD COLUMN IF NOT EXISTS shap_summary_json JSONB",
+    "ALTER TABLE ml.model_registry ADD COLUMN IF NOT EXISTS model_scope VARCHAR(50) NOT NULL DEFAULT 'global'",
+    "ALTER TABLE ml.model_registry ADD COLUMN IF NOT EXISTS scope_filters_json JSONB",
 ]
 
 

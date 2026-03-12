@@ -109,6 +109,8 @@ uvicorn vehicle_price_estimator.api.main:app --reload
 - `GET /api/v1/market/summary`
 - `GET /api/v1/market/distribution`
 - `GET /api/v1/market/comparables`
+- `GET /api/v1/predictions/models/active`
+- `POST /api/v1/predictions/estimate`
 
 ## Scripts disponibles
 
@@ -119,6 +121,8 @@ uvicorn vehicle_price_estimator.api.main:app --reload
 - `python scripts/run_inventory_capture.py --campaign discovery --brands toyota,mazda,chevrolet --regions bogota,medellin,cali`
 - `python scripts/train_models.py`
 - `python scripts/promote_model.py --registry-id TU_UUID`
+- `python scripts/promote_model.py --latest-scope global`
+- `python scripts/promote_model.py --latest-scope mainstream`
 
 ## Extraccion inicial Mercado Libre Colombia
 
@@ -308,6 +312,79 @@ Si quieres incluir outliers o anuncios inactivos:
 ```powershell
 python scripts/train_models.py --include-outliers --include-inactive
 ```
+
+Para entrenar el modelo segmentado mainstream:
+
+```powershell
+python scripts/train_models.py --brands Toyota,Mazda,Renault,Chevrolet,Volkswagen --min-model-rows 15 --no-promote
+```
+
+Para promover el mejor global y el mejor mainstream por separado:
+
+```powershell
+python scripts/promote_model.py --latest-scope global
+python scripts/promote_model.py --latest-scope mainstream
+```
+
+## Serving y prediccion
+
+La Fase 6 agrega una capa de serving con doble modelo:
+
+- `global`: fallback para cualquier marca con cobertura limitada
+- `mainstream`: preferido para `Toyota`, `Mazda`, `Renault`, `Chevrolet`, `Volkswagen`
+
+El router de prediccion usa la marca para decidir el scope solicitado y luego:
+
+1. intenta usar el modelo activo del scope correcto
+2. si no existe, usa el ultimo modelo registrado de ese scope
+3. si el scope solicitado es `mainstream` y no hay modelo disponible, cae a `global`
+
+Ejemplos:
+
+```powershell
+python -m uvicorn vehicle_price_estimator.api.main:app --reload
+```
+
+Consultar modelos activos:
+
+```text
+GET /api/v1/predictions/models/active
+```
+
+Estimar precio:
+
+```text
+POST /api/v1/predictions/estimate
+```
+
+Payload ejemplo:
+
+```json
+{
+  "brand_std": "Toyota",
+  "model_std": "Corolla Cross",
+  "trim_std": "XEI",
+  "year": 2022,
+  "mileage_km": 42000,
+  "engine_displacement_std": "2.0",
+  "transmission_std": "Automatica",
+  "fuel_type_std": "Hibrido",
+  "department_std": "Bogotá D.C.",
+  "municipality_std": "Bogota D.C.",
+  "locality_std": "Suba",
+  "hybrid_flag": true,
+  "mhev_flag": false
+}
+```
+
+La respuesta incluye:
+
+- precio estimado en COP
+- rango estimado
+- score y etiqueta de confianza
+- modelo usado y scope efectivo
+- comparables
+- explicacion SHAP local si el modelo lo soporta
 
 ## Nota sobre Supabase
 

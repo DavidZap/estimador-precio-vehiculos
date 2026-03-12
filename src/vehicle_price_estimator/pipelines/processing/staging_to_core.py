@@ -484,6 +484,21 @@ def _compute_iqr_bounds(prices: list[Decimal]) -> tuple[Decimal | None, Decimal 
     return Decimal(str(q1 - 1.5 * iqr)), Decimal(str(q3 + 1.5 * iqr))
 
 
+def _compute_vehicle_age_bucket(vehicle_age: Decimal | None) -> str | None:
+    if vehicle_age is None:
+        return None
+    age_value = float(vehicle_age)
+    if age_value < 3:
+        return "0_2"
+    if age_value < 5:
+        return "3_4"
+    if age_value < 10:
+        return "5_9"
+    if age_value < 15:
+        return "10_14"
+    return "15_plus"
+
+
 def _normalize_staging_record(record: StagingMarketplaceListingModel) -> NormalizedListing:
     city_std, state_std = _normalize_city_state(record.city_raw, record.state_raw)
     brand_std = _normalize_brand(record.brand_raw)
@@ -810,8 +825,16 @@ def process_staging_to_core(extract_run_id: str | None = None) -> None:
 
             vehicle_age = None
             km_per_year = None
+            vehicle_age_bucket = None
+            technomechanical_required_flag = False
+            years_since_technomechanical_threshold = None
             if row.year:
                 vehicle_age = Decimal(max(CURRENT_YEAR - row.year, 0))
+                vehicle_age_bucket = _compute_vehicle_age_bucket(vehicle_age)
+                technomechanical_required_flag = vehicle_age >= Decimal("5")
+                years_since_technomechanical_threshold = max(vehicle_age - Decimal("5"), Decimal("0")).quantize(
+                    Decimal("0.00")
+                )
                 if row.mileage_km is not None and vehicle_age > 0:
                     km_per_year = (row.mileage_km / vehicle_age).quantize(Decimal("0.01"))
 
@@ -840,6 +863,9 @@ def process_staging_to_core(extract_run_id: str | None = None) -> None:
 
             feature.snapshot_date = row.observed_at.date()
             feature.vehicle_age = vehicle_age
+            feature.vehicle_age_bucket = vehicle_age_bucket
+            feature.technomechanical_required_flag = technomechanical_required_flag
+            feature.years_since_technomechanical_threshold = years_since_technomechanical_threshold
             feature.km_per_year = km_per_year
             feature.equipment_score = equipment_score
             feature.version_rarity_score = version_rarity_score

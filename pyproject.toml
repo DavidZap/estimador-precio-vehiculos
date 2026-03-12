@@ -26,6 +26,7 @@ dependencies = [
   "psycopg[binary]>=3.2.0",
   "python-dotenv>=1.0.0",
   "scikit-learn>=1.6.1",
+  "shap>=0.46.0",
   "sqlalchemy>=2.0.36",
   "uvicorn[standard]>=0.34.0",
   "xgboost>=2.1.4"

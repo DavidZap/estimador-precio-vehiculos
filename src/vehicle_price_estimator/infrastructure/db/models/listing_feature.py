@@ -2,7 +2,7 @@ import uuid
 from datetime import date
 from decimal import Decimal
 
-from sqlalchemy import Date, ForeignKey, Numeric, String
+from sqlalchemy import Boolean, Date, ForeignKey, Numeric, String
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -20,6 +20,12 @@ class ListingFeatureModel(Base):
     )
     snapshot_date: Mapped[date] = mapped_column(Date, nullable=False)
     vehicle_age: Mapped[Decimal | None] = mapped_column(Numeric(6, 2), nullable=True)
+    vehicle_age_bucket: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    technomechanical_required_flag: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    years_since_technomechanical_threshold: Mapped[Decimal | None] = mapped_column(
+        Numeric(6, 2),
+        nullable=True,
+    )
     km_per_year: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
     equipment_score: Mapped[Decimal | None] = mapped_column(Numeric(8, 4), nullable=True)
     version_rarity_score: Mapped[Decimal | None] = mapped_column(Numeric(8, 4), nullable=True)

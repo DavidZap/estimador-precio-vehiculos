@@ -21,8 +21,11 @@ class ModelRegistryModel(Base):
     metrics_json: Mapped[dict] = mapped_column(JSONB, nullable=False)
     params_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     feature_schema_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    selected_features_json: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    shap_summary_json: Mapped[list[dict] | None] = mapped_column(JSONB, nullable=True)
+    model_scope: Mapped[str] = mapped_column(String(50), nullable=False, default="global")
+    scope_filters_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     status: Mapped[str] = mapped_column(String(50), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     promoted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
-

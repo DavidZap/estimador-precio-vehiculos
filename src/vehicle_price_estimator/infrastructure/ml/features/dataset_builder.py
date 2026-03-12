@@ -6,44 +6,18 @@ from datetime import UTC, datetime
 import json
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from sqlalchemy import text
 
 from vehicle_price_estimator.config.settings import get_settings
 from vehicle_price_estimator.infrastructure.db.session import SessionLocal
-
-
-NUMERIC_FEATURES = [
-    "year",
-    "mileage_km",
-    "engine_cc",
-    "vehicle_age",
-    "km_per_year",
-    "equipment_score",
-    "version_rarity_score",
-    "regional_market_score",
-    "listing_age_days",
-    "comparable_inventory_density",
-    "hybrid_flag",
-    "mhev_flag",
-]
-
-CATEGORICAL_FEATURES = [
-    "brand_std",
-    "model_std",
-    "trim_std",
-    "engine_displacement_std",
-    "transmission_std",
-    "fuel_type_std",
-    "vehicle_type_std",
-    "department_std",
-    "municipality_std",
-    "locality_std",
-    "color_std",
-]
-
-TARGET_COLUMN = "price_cop"
-IDENTIFIER_COLUMNS = ["listing_id", "source_listing_id", "source_name", "first_seen_at", "updated_at"]
+from vehicle_price_estimator.infrastructure.ml.features.feature_schema import (
+    CATEGORICAL_FEATURES,
+    IDENTIFIER_COLUMNS,
+    NUMERIC_FEATURES,
+    TARGET_COLUMN,
+)
 
 
 @dataclass(slots=True)
@@ -61,6 +35,8 @@ def build_training_dataset(
     min_year: int = 2010,
     exclude_outliers: bool = True,
     active_only: bool = True,
+    include_brands: list[str] | None = None,
+    min_model_rows: int = 1,
 ) -> TrainingDataset:
     settings = get_settings()
     dataset_id = uuid.uuid4()
@@ -107,6 +83,9 @@ def build_training_dataset(
             l.first_seen_at,
             l.updated_at,
             f.vehicle_age,
+            f.vehicle_age_bucket,
+            cast(f.technomechanical_required_flag as integer) as technomechanical_required_flag,
+            f.years_since_technomechanical_threshold,
             f.km_per_year,
             f.equipment_score,
             f.version_rarity_score,
@@ -128,9 +107,65 @@ def build_training_dataset(
     if dataframe.empty:
         raise ValueError("No hay datos suficientes para construir el dataset de entrenamiento.")
 
+    if include_brands:
+        normalized_brands = {brand.strip().lower() for brand in include_brands if brand.strip()}
+        dataframe = dataframe[
+            dataframe["brand_std"].fillna("").astype(str).str.lower().isin(normalized_brands)
+        ].copy()
+
+    if min_model_rows > 1 and not dataframe.empty:
+        model_sizes = dataframe.groupby(["brand_std", "model_std"])["listing_id"].transform("count")
+        dataframe = dataframe[model_sizes >= min_model_rows].copy()
+
+    if dataframe.empty:
+        raise ValueError("No hay datos suficientes luego de aplicar los filtros del dataset.")
+
+    for column in ["listing_id", "source_listing_id", "source_name"]:
+        if column in dataframe.columns:
+            dataframe[column] = dataframe[column].astype("string")
+
+    for column in ["first_seen_at", "updated_at"]:
+        if column in dataframe.columns:
+            dataframe[column] = pd.to_datetime(dataframe[column], errors="coerce", utc=True)
+
     for column in NUMERIC_FEATURES + [TARGET_COLUMN]:
         if column in dataframe.columns:
             dataframe[column] = pd.to_numeric(dataframe[column], errors="coerce")
+
+    dataframe["vehicle_age_squared"] = dataframe["vehicle_age"].fillna(0) ** 2
+    dataframe["is_recent_vehicle_flag"] = (dataframe["vehicle_age"].fillna(999) < 3).astype(int)
+    dataframe["is_older_vehicle_flag"] = (dataframe["vehicle_age"].fillna(0) >= 10).astype(int)
+    dataframe["log_mileage_km"] = dataframe["mileage_km"].fillna(0).apply(lambda value: float(np.log1p(value)))
+    dataframe["mileage_per_vehicle_age"] = (
+        dataframe["mileage_km"].fillna(0) / dataframe["vehicle_age"].replace({0: pd.NA})
+    ).fillna(0)
+    dataframe["brand_model_key"] = (
+        dataframe["brand_std"].fillna("unknown").astype(str)
+        + "|"
+        + dataframe["model_std"].fillna("unknown").astype(str)
+    )
+    dataframe["brand_model_trim_key"] = (
+        dataframe["brand_std"].fillna("unknown").astype(str)
+        + "|"
+        + dataframe["model_std"].fillna("unknown").astype(str)
+        + "|"
+        + dataframe["trim_std"].fillna("unknown").astype(str)
+    )
+
+    premium_brands = {"Audi", "BMW", "Mercedes-Benz", "Lexus", "Volvo", "Jaguar", "Land Rover"}
+    dataframe["is_premium_brand_flag"] = dataframe["brand_std"].isin(premium_brands).astype(int)
+
+    dataframe["brand_model_inventory_count"] = (
+        dataframe.groupby(["brand_std", "model_std"])["listing_id"].transform("count").astype(float)
+    )
+    dataframe["brand_model_year_inventory_count"] = (
+        dataframe.groupby(["brand_std", "model_std", "year"])["listing_id"].transform("count").astype(float)
+    )
+    dataframe["brand_model_municipality_inventory_count"] = (
+        dataframe.groupby(["brand_std", "model_std", "municipality_std"])["listing_id"]
+        .transform("count")
+        .astype(float)
+    )
 
     dataset_path = datasets_root / f"{dataset_id}.parquet"
     metadata_path = datasets_root / f"{dataset_id}.metadata.json"
@@ -146,6 +181,8 @@ def build_training_dataset(
         "min_year": min_year,
         "exclude_outliers": exclude_outliers,
         "active_only": active_only,
+        "include_brands": include_brands or [],
+        "min_model_rows": min_model_rows,
         "created_at": created_at.isoformat(),
     }
     metadata_path.write_text(

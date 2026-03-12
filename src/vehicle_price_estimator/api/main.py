@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from vehicle_price_estimator.api.routers import health, market, meta
+from vehicle_price_estimator.api.routers import health, market, meta, prediction
 from vehicle_price_estimator.config.logging import configure_logging
 from vehicle_price_estimator.config.settings import get_settings
 
@@ -31,3 +31,4 @@ def application_health() -> dict[str, str]:
 app.include_router(health.router, prefix=settings.api_prefix)
 app.include_router(market.router, prefix=settings.api_prefix)
 app.include_router(meta.router, prefix=settings.api_prefix)
+app.include_router(prediction.router, prefix=settings.api_prefix)

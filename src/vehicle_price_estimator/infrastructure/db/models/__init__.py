@@ -5,6 +5,7 @@ from vehicle_price_estimator.infrastructure.db.models.listing_status_history imp
 from vehicle_price_estimator.infrastructure.db.models.model_registry import ModelRegistryModel
 from vehicle_price_estimator.infrastructure.db.models.pipeline_run import PipelineRunModel
 from vehicle_price_estimator.infrastructure.db.models.price_history import ListingPriceHistoryModel
+from vehicle_price_estimator.infrastructure.db.models.prediction_log import PredictionLogModel
 from vehicle_price_estimator.infrastructure.db.models.raw_listing_payload import ListingPayloadModel
 from vehicle_price_estimator.infrastructure.db.models.raw_run import ExtractRunModel
 from vehicle_price_estimator.infrastructure.db.models.staging_listing import (
@@ -21,6 +22,7 @@ __all__ = [
     "ListingStatusHistoryModel",
     "ModelRegistryModel",
     "PipelineRunModel",
+    "PredictionLogModel",
     "StagingMarketplaceListingModel",
     "VehicleCanonicalModel",
 ]

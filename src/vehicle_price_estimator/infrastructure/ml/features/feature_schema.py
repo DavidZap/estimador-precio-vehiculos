@@ -1,0 +1,45 @@
+NUMERIC_FEATURES = [
+    "year",
+    "mileage_km",
+    "engine_cc",
+    "vehicle_age",
+    "vehicle_age_squared",
+    "is_recent_vehicle_flag",
+    "is_older_vehicle_flag",
+    "technomechanical_required_flag",
+    "years_since_technomechanical_threshold",
+    "km_per_year",
+    "log_mileage_km",
+    "mileage_per_vehicle_age",
+    "equipment_score",
+    "version_rarity_score",
+    "regional_market_score",
+    "listing_age_days",
+    "comparable_inventory_density",
+    "brand_model_inventory_count",
+    "brand_model_year_inventory_count",
+    "brand_model_municipality_inventory_count",
+    "is_premium_brand_flag",
+    "hybrid_flag",
+    "mhev_flag",
+]
+
+CATEGORICAL_FEATURES = [
+    "brand_std",
+    "model_std",
+    "trim_std",
+    "engine_displacement_std",
+    "vehicle_age_bucket",
+    "transmission_std",
+    "fuel_type_std",
+    "vehicle_type_std",
+    "department_std",
+    "municipality_std",
+    "locality_std",
+    "color_std",
+    "brand_model_key",
+    "brand_model_trim_key",
+]
+
+TARGET_COLUMN = "price_cop"
+IDENTIFIER_COLUMNS = ["listing_id", "source_listing_id", "source_name", "first_seen_at", "updated_at"]

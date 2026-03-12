@@ -9,8 +9,10 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
+import warnings
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
+from sklearn.feature_selection import SelectFromModel
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import ElasticNet
 from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error, mean_squared_error, r2_score
@@ -30,6 +32,11 @@ from vehicle_price_estimator.infrastructure.ml.features.dataset_builder import (
     TrainingDataset,
     build_training_dataset,
 )
+from vehicle_price_estimator.infrastructure.ml.serving.scopes import (
+    infer_model_scope,
+    normalize_brand_list,
+    resolve_registry_scope,
+)
 
 
 LOGGER = get_logger(__name__)
@@ -46,6 +53,39 @@ class ModelCandidateResult:
     dataset_id: uuid.UUID
     feature_schema: dict
     trained_at: datetime
+    selected_feature_names: list[str]
+    model_scope: str
+    scope_filters: dict
+    shap_summary: list[dict] | None = None
+
+
+RAW_FEATURE_PRIORITY = [
+    "brand_std",
+    "model_std",
+    "year",
+    "mileage_km",
+    "vehicle_age",
+    "vehicle_age_bucket",
+    "technomechanical_required_flag",
+    "years_since_technomechanical_threshold",
+    "trim_std",
+    "engine_displacement_std",
+    "engine_cc",
+    "transmission_std",
+    "fuel_type_std",
+    "municipality_std",
+    "department_std",
+    "hybrid_flag",
+    "mhev_flag",
+    "km_per_year",
+    "equipment_score",
+    "brand_model_inventory_count",
+    "brand_model_year_inventory_count",
+    "brand_model_municipality_inventory_count",
+    "is_premium_brand_flag",
+    "vehicle_type_std",
+    "locality_std",
+]
 
 
 def _build_preprocessor() -> ColumnTransformer:
@@ -58,7 +98,7 @@ def _build_preprocessor() -> ColumnTransformer:
     categorical_transformer = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="most_frequent")),
-            ("encoder", OneHotEncoder(handle_unknown="ignore")),
+            ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
         ]
     )
 
@@ -67,6 +107,14 @@ def _build_preprocessor() -> ColumnTransformer:
             ("num", numeric_transformer, NUMERIC_FEATURES),
             ("cat", categorical_transformer, CATEGORICAL_FEATURES),
         ]
+    )
+
+
+def _build_selector() -> SelectFromModel:
+    return SelectFromModel(
+        estimator=ElasticNet(alpha=0.0005, l1_ratio=0.9, random_state=42, max_iter=5000),
+        threshold="median",
+        max_features=80,
     )
 
 
@@ -102,11 +150,134 @@ def _split_dataset(dataset: TrainingDataset) -> tuple[pd.DataFrame, pd.DataFrame
     return dataframe.iloc[:split_index].copy(), dataframe.iloc[split_index:].copy()
 
 
+def _apply_train_only_context_features(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    train_df = train_df.copy()
+    test_df = test_df.copy()
+
+    group_keys = {
+        "brand_model_inventory_count": ["brand_std", "model_std"],
+        "brand_model_year_inventory_count": ["brand_std", "model_std", "year"],
+        "brand_model_municipality_inventory_count": ["brand_std", "model_std", "municipality_std"],
+    }
+
+    for feature_name, group_columns in group_keys.items():
+        grouped = (
+            train_df.groupby(group_columns, dropna=False)["listing_id"]
+            .count()
+            .rename(feature_name)
+            .reset_index()
+        )
+        train_df = train_df.drop(columns=[feature_name], errors="ignore").merge(
+            grouped,
+            on=group_columns,
+            how="left",
+        )
+        test_df = test_df.drop(columns=[feature_name], errors="ignore").merge(
+            grouped,
+            on=group_columns,
+            how="left",
+        )
+        train_df[feature_name] = train_df[feature_name].fillna(0).astype(float)
+        test_df[feature_name] = test_df[feature_name].fillna(0).astype(float)
+
+    return train_df, test_df
+
+
 def _prepare_xy(dataframe: pd.DataFrame) -> tuple[pd.DataFrame, np.ndarray]:
     feature_columns = [*NUMERIC_FEATURES, *CATEGORICAL_FEATURES]
     X = dataframe[feature_columns].copy()
     y = np.log1p(dataframe[TARGET_COLUMN].astype(float).to_numpy())
     return X, y
+
+
+def _select_raw_feature_columns(dataframe: pd.DataFrame) -> list[str]:
+    selected: list[str] = []
+    for column in RAW_FEATURE_PRIORITY:
+        if column not in dataframe.columns:
+            continue
+        series = dataframe[column]
+        missing_ratio = float(series.isna().mean())
+        unique_count = int(series.nunique(dropna=True))
+        essential = column in {"brand_std", "model_std", "year", "mileage_km"}
+        if not essential and missing_ratio > 0.75:
+            continue
+        if unique_count <= 1:
+            continue
+        selected.append(column)
+    return selected
+
+
+def _extract_selected_feature_names(estimator: Pipeline, input_frame: pd.DataFrame) -> list[str]:
+    preprocessor = estimator.named_steps["preprocessor"]
+    feature_names = list(preprocessor.get_feature_names_out())
+    selector = estimator.named_steps.get("selector")
+    if selector is not None:
+        support_mask = selector.get_support()
+        feature_names = [name for name, keep in zip(feature_names, support_mask, strict=False) if keep]
+    return feature_names
+
+
+def _prepare_shap_payload(estimator, algorithm: str, X_test: pd.DataFrame) -> tuple[object, list[str]] | tuple[None, list[str]]:
+    if algorithm == "catboost":
+        return X_test, list(X_test.columns)
+
+    if not isinstance(estimator, Pipeline):
+        return None, []
+
+    transformed = estimator.named_steps["preprocessor"].transform(X_test)
+    selector = estimator.named_steps.get("selector")
+    if selector is not None:
+        transformed = selector.transform(transformed)
+
+    if hasattr(transformed, "toarray"):
+        transformed = transformed.toarray()
+
+    return transformed, _extract_selected_feature_names(estimator, X_test)
+
+
+def _compute_shap_summary(model, algorithm: str, shap_input, feature_names: list[str]) -> list[dict] | None:
+    try:
+        import shap
+    except ImportError:
+        LOGGER.warning("SHAP no está instalado; se omite explicabilidad.")
+        return None
+
+    if shap_input is None or not feature_names:
+        return None
+
+    try:
+        sample_size = min(len(shap_input), 200)
+        if hasattr(shap_input, "iloc"):
+            sample = shap_input.iloc[:sample_size].copy()
+        else:
+            sample = shap_input[:sample_size]
+
+        if algorithm == "catboost":
+            explainer = shap.TreeExplainer(model)
+            shap_values = explainer.shap_values(sample)
+            values = np.abs(np.array(shap_values))
+        else:
+            explainer = shap.Explainer(model, sample)
+            shap_values = explainer(sample)
+            values = np.abs(shap_values.values)
+        if values.ndim == 3:
+            values = values.mean(axis=0)
+        mean_abs = values.mean(axis=0)
+        ranking = sorted(
+            zip(feature_names, mean_abs, strict=False),
+            key=lambda item: item[1],
+            reverse=True,
+        )[:15]
+        return [
+            {"feature": feature, "mean_abs_shap": round(float(score), 6)}
+            for feature, score in ranking
+        ]
+    except Exception as exc:
+        LOGGER.warning("No fue posible calcular SHAP para %s: %s", algorithm, exc)
+        return None
 
 
 def _evaluate_predictions(y_true_log: np.ndarray, y_pred_log: np.ndarray) -> dict[str, float]:
@@ -163,6 +334,7 @@ def _optional_model_candidates() -> list[tuple[str, str, object, dict]]:
                 Pipeline(
                     steps=[
                         ("preprocessor", _build_dense_preprocessor()),
+                        ("selector", _build_selector()),
                         (
                             "model",
                             LGBMRegressor(
@@ -170,6 +342,7 @@ def _optional_model_candidates() -> list[tuple[str, str, object, dict]]:
                                 learning_rate=0.05,
                                 num_leaves=31,
                                 random_state=42,
+                                verbose=-1,
                             ),
                         ),
                     ]
@@ -194,6 +367,7 @@ def _optional_model_candidates() -> list[tuple[str, str, object, dict]]:
                 Pipeline(
                     steps=[
                         ("preprocessor", _build_dense_preprocessor()),
+                        ("selector", _build_selector()),
                         (
                             "model",
                             XGBRegressor(
@@ -231,6 +405,7 @@ def _baseline_candidates() -> list[tuple[str, str, object, dict]]:
             Pipeline(
                 steps=[
                     ("preprocessor", _build_preprocessor()),
+                    ("selector", _build_selector()),
                     ("model", ElasticNet(alpha=0.0008, l1_ratio=0.15, random_state=42, max_iter=5000)),
                 ]
             ),
@@ -242,6 +417,7 @@ def _baseline_candidates() -> list[tuple[str, str, object, dict]]:
             Pipeline(
                 steps=[
                     ("preprocessor", _build_dense_preprocessor()),
+                    ("selector", _build_selector()),
                     (
                         "model",
                         RandomForestRegressor(
@@ -262,6 +438,7 @@ def _baseline_candidates() -> list[tuple[str, str, object, dict]]:
             Pipeline(
                 steps=[
                     ("preprocessor", _build_dense_preprocessor()),
+                    ("selector", _build_selector()),
                     (
                         "model",
                         HistGradientBoostingRegressor(
@@ -280,24 +457,39 @@ def _baseline_candidates() -> list[tuple[str, str, object, dict]]:
 
 def _fit_candidate(model_name: str, algorithm: str, estimator, params: dict, dataset: TrainingDataset) -> ModelCandidateResult:
     train_df, test_df = _split_dataset(dataset)
+    train_df, test_df = _apply_train_only_context_features(train_df, test_df)
     X_train, y_train = _prepare_xy(train_df)
     X_test, y_test = _prepare_xy(test_df)
+    selected_feature_names: list[str] = []
+    shap_summary: list[dict] | None = None
 
     if algorithm == "catboost":
-        X_train_cb = X_train.copy()
-        X_test_cb = X_test.copy()
-        categorical_features = [column for column in CATEGORICAL_FEATURES if column in X_train_cb.columns]
+        selected_columns = _select_raw_feature_columns(train_df)
+        X_train_cb = X_train[selected_columns].copy()
+        X_test_cb = X_test[selected_columns].copy()
+        categorical_features = [column for column in selected_columns if column in CATEGORICAL_FEATURES]
         for column in categorical_features:
             X_train_cb[column] = X_train_cb[column].fillna("__missing__").astype(str)
             X_test_cb[column] = X_test_cb[column].fillna("__missing__").astype(str)
-        for column in NUMERIC_FEATURES:
+        for column in [column for column in selected_columns if column in NUMERIC_FEATURES]:
             X_train_cb[column] = pd.to_numeric(X_train_cb[column], errors="coerce")
             X_test_cb[column] = pd.to_numeric(X_test_cb[column], errors="coerce")
         estimator.fit(X_train_cb, y_train, cat_features=categorical_features)
         predictions = estimator.predict(X_test_cb)
+        selected_feature_names = selected_columns
+        shap_summary = _compute_shap_summary(estimator, algorithm, X_test_cb, selected_feature_names)
     else:
-        estimator.fit(X_train, y_train)
-        predictions = estimator.predict(X_test)
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="X does not have valid feature names, but LGBMRegressor was fitted with feature names",
+            )
+            estimator.fit(X_train, y_train)
+            predictions = estimator.predict(X_test)
+        selected_feature_names = _extract_selected_feature_names(estimator, X_train)
+        shap_input, shap_feature_names = _prepare_shap_payload(estimator, algorithm, X_test)
+        final_model = estimator.named_steps["model"] if isinstance(estimator, Pipeline) else estimator
+        shap_summary = _compute_shap_summary(final_model, algorithm, shap_input, shap_feature_names or selected_feature_names)
 
     metrics = _evaluate_predictions(y_test, predictions)
 
@@ -331,6 +523,8 @@ def _fit_candidate(model_name: str, algorithm: str, estimator, params: dict, dat
                 "metrics": metrics,
                 "dataset_id": str(dataset.dataset_id),
                 "trained_at": datetime.now(UTC).isoformat(),
+                "selected_feature_names": selected_feature_names,
+                "shap_summary": shap_summary,
             },
             indent=2,
         ),
@@ -347,6 +541,10 @@ def _fit_candidate(model_name: str, algorithm: str, estimator, params: dict, dat
         dataset_id=dataset.dataset_id,
         feature_schema=dataset.feature_schema,
         trained_at=datetime.now(UTC),
+        selected_feature_names=selected_feature_names,
+        model_scope="global",
+        scope_filters={},
+        shap_summary=shap_summary,
     )
 
 
@@ -361,6 +559,10 @@ def _register_candidate(result: ModelCandidateResult) -> uuid.UUID:
             metrics_json=result.metrics,
             params_json=result.params,
             feature_schema_json=result.feature_schema,
+            selected_features_json=result.selected_feature_names,
+            shap_summary_json=result.shap_summary,
+            model_scope=result.model_scope,
+            scope_filters_json=result.scope_filters,
             status="trained",
             is_active=False,
         )
@@ -372,11 +574,17 @@ def _register_candidate(result: ModelCandidateResult) -> uuid.UUID:
 
 def _promote_if_better(result: ModelCandidateResult, registry_id: uuid.UUID) -> bool:
     with SessionLocal() as db:
-        active_model = (
-            db.query(ModelRegistryModel)
-            .filter(ModelRegistryModel.is_active.is_(True))
-            .order_by(ModelRegistryModel.created_at.desc())
-            .first()
+        active_model = next(
+            (
+                row
+                for row in db.query(ModelRegistryModel)
+                .filter(ModelRegistryModel.is_active.is_(True))
+                .order_by(ModelRegistryModel.created_at.desc())
+                .all()
+                if resolve_registry_scope(row.model_scope, row.scope_filters_json, row.feature_schema_json)
+                == result.model_scope
+            ),
+            None,
         )
 
         should_promote = active_model is None
@@ -404,8 +612,17 @@ def run_training_pipeline(
     min_year: int = 2010,
     exclude_outliers: bool = True,
     active_only: bool = True,
+    include_brands: list[str] | None = None,
+    min_model_rows: int = 1,
+    promote: bool = True,
 ) -> dict:
     started_at = datetime.now(UTC)
+    normalized_brands = normalize_brand_list(include_brands)
+    model_scope = infer_model_scope(normalized_brands)
+    scope_filters = {
+        "include_brands": normalized_brands,
+        "min_model_rows": min_model_rows,
+    }
     with SessionLocal() as db:
         pipeline_run = PipelineRunModel(
             pipeline_name="training_pipeline_v0_1",
@@ -414,6 +631,10 @@ def run_training_pipeline(
                 "min_year": min_year,
                 "exclude_outliers": exclude_outliers,
                 "active_only": active_only,
+                "include_brands": normalized_brands,
+                "min_model_rows": min_model_rows,
+                "model_scope": model_scope,
+                "promote": promote,
             },
             started_at=started_at,
         )
@@ -427,6 +648,8 @@ def run_training_pipeline(
             min_year=min_year,
             exclude_outliers=exclude_outliers,
             active_only=active_only,
+            include_brands=normalized_brands,
+            min_model_rows=min_model_rows,
         )
 
         candidates = _baseline_candidates()
@@ -437,6 +660,8 @@ def run_training_pipeline(
         results: list[tuple[uuid.UUID, ModelCandidateResult]] = []
         for model_name, algorithm, estimator, params in candidates:
             result = _fit_candidate(model_name, algorithm, estimator, params, dataset)
+            result.model_scope = model_scope
+            result.scope_filters = scope_filters
             registry_id = _register_candidate(result)
             results.append((registry_id, result))
 
@@ -444,16 +669,21 @@ def run_training_pipeline(
             results,
             key=lambda item: (item[1].metrics["mae"], item[1].metrics["rmse"]),
         )[0]
-        promoted = _promote_if_better(best_result, best_registry_id)
+        promoted = _promote_if_better(best_result, best_registry_id) if promote else False
 
         summary = {
             "dataset_id": str(dataset.dataset_id),
             "dataset_path": str(dataset.dataset_path),
             "row_count": int(len(dataset.dataframe)),
             "candidate_count": len(results),
+            "include_brands": normalized_brands,
+            "min_model_rows": min_model_rows,
+            "model_scope": model_scope,
             "best_model_name": best_result.model_name,
             "best_algorithm": best_result.algorithm,
             "best_metrics": best_result.metrics,
+            "best_selected_features": best_result.selected_feature_names,
+            "best_shap_summary": best_result.shap_summary,
             "promoted": promoted,
             "candidates": [
                 {
@@ -461,6 +691,7 @@ def run_training_pipeline(
                     "model_name": result.model_name,
                     "algorithm": result.algorithm,
                     "metrics": result.metrics,
+                    "selected_feature_count": len(result.selected_feature_names),
                 }
                 for registry_id, result in results
             ],
@@ -489,12 +720,23 @@ def promote_model(registry_id: uuid.UUID) -> bool:
         candidate = db.query(ModelRegistryModel).filter(ModelRegistryModel.id == registry_id).one_or_none()
         if candidate is None:
             raise ValueError(f"No existe modelo con id {registry_id}")
+        candidate_scope = resolve_registry_scope(
+            candidate.model_scope,
+            candidate.scope_filters_json,
+            candidate.feature_schema_json,
+        )
 
-        active_model = (
-            db.query(ModelRegistryModel)
-            .filter(ModelRegistryModel.is_active.is_(True))
-            .order_by(ModelRegistryModel.created_at.desc())
-            .first()
+        active_model = next(
+            (
+                row
+                for row in db.query(ModelRegistryModel)
+                .filter(ModelRegistryModel.is_active.is_(True))
+                .order_by(ModelRegistryModel.created_at.desc())
+                .all()
+                if resolve_registry_scope(row.model_scope, row.scope_filters_json, row.feature_schema_json)
+                == candidate_scope
+            ),
+            None,
         )
 
         if active_model is not None and active_model.id == candidate.id:
@@ -510,7 +752,109 @@ def promote_model(registry_id: uuid.UUID) -> bool:
             active_model.status = "archived"
 
         candidate.is_active = True
+        candidate.model_scope = candidate_scope
         candidate.status = "promoted"
         candidate.promoted_at = datetime.now(UTC)
         db.commit()
         return True
+
+
+def force_promote_model(registry_id: uuid.UUID) -> bool:
+    with SessionLocal() as db:
+        candidate = db.query(ModelRegistryModel).filter(ModelRegistryModel.id == registry_id).one_or_none()
+        if candidate is None:
+            raise ValueError(f"No existe modelo con id {registry_id}")
+
+        candidate_scope = resolve_registry_scope(
+            candidate.model_scope,
+            candidate.scope_filters_json,
+            candidate.feature_schema_json,
+        )
+
+        active_models = (
+            db.query(ModelRegistryModel)
+            .filter(ModelRegistryModel.is_active.is_(True))
+            .order_by(ModelRegistryModel.created_at.desc())
+            .all()
+        )
+        for active in active_models:
+            if resolve_registry_scope(active.model_scope, active.scope_filters_json, active.feature_schema_json) == candidate_scope:
+                active.is_active = False
+                active.status = "archived"
+
+        candidate.is_active = True
+        candidate.model_scope = candidate_scope
+        candidate.status = "promoted"
+        candidate.promoted_at = datetime.now(UTC)
+        db.commit()
+        return True
+
+
+def promote_latest_model_for_scope(scope: str) -> uuid.UUID | None:
+    with SessionLocal() as db:
+        candidates = [
+            row
+            for row in db.query(ModelRegistryModel).order_by(ModelRegistryModel.created_at.desc()).all()
+            if resolve_registry_scope(row.model_scope, row.scope_filters_json, row.feature_schema_json) == scope
+        ]
+        if not candidates:
+            return None
+
+        best_candidate = min(
+            candidates,
+            key=lambda row: (
+                float((row.metrics_json or {}).get("mae", float("inf"))),
+                float((row.metrics_json or {}).get("rmse", float("inf"))),
+            ),
+        )
+        promote_model(best_candidate.id)
+        return best_candidate.id
+
+
+def promote_preferred_model_for_scope(scope: str, preferred_algorithm: str) -> uuid.UUID | None:
+    with SessionLocal() as db:
+        candidates = [
+            row
+            for row in db.query(ModelRegistryModel).order_by(ModelRegistryModel.created_at.desc()).all()
+            if resolve_registry_scope(row.model_scope, row.scope_filters_json, row.feature_schema_json) == scope
+        ]
+        if not candidates:
+            return None
+
+        preferred_candidates = [
+            row for row in candidates if (row.algorithm or "").strip().lower() == preferred_algorithm.strip().lower()
+        ]
+        if preferred_candidates:
+            chosen = min(
+                preferred_candidates,
+                key=lambda row: (
+                    float((row.metrics_json or {}).get("mae", float("inf"))),
+                    float((row.metrics_json or {}).get("rmse", float("inf"))),
+                ),
+            )
+        else:
+            chosen = min(
+                candidates,
+                key=lambda row: (
+                    float((row.metrics_json or {}).get("mae", float("inf"))),
+                    float((row.metrics_json or {}).get("rmse", float("inf"))),
+                ),
+            )
+
+        active_models = (
+            db.query(ModelRegistryModel)
+            .filter(ModelRegistryModel.is_active.is_(True))
+            .order_by(ModelRegistryModel.created_at.desc())
+            .all()
+        )
+        for active in active_models:
+            if resolve_registry_scope(active.model_scope, active.scope_filters_json, active.feature_schema_json) == scope:
+                active.is_active = False
+                active.status = "archived"
+
+        chosen.is_active = True
+        chosen.model_scope = scope
+        chosen.status = "promoted"
+        chosen.promoted_at = datetime.now(UTC)
+        db.commit()
+        return chosen.id
