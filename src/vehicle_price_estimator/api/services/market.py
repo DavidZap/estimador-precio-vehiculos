@@ -22,9 +22,104 @@ from vehicle_price_estimator.infrastructure.db.models.staging_listing import (
 )
 from vehicle_price_estimator.infrastructure.db.models.vehicle import ListingModel
 
+KNOWN_BRANDS = {
+    "Acura",
+    "Alfa Romeo",
+    "Audi",
+    "BMW",
+    "BYD",
+    "Chevrolet",
+    "Chery",
+    "Citroen",
+    "Cupra",
+    "DFSK",
+    "Dodge",
+    "DS",
+    "Fiat",
+    "Ford",
+    "Foton",
+    "Great Wall",
+    "Honda",
+    "Hyundai",
+    "Isuzu",
+    "JAC",
+    "Jaguar",
+    "Jeep",
+    "Kia",
+    "Land Rover",
+    "Lexus",
+    "Mazda",
+    "Mercedes-Benz",
+    "MG",
+    "Mini",
+    "Mitsubishi",
+    "Nissan",
+    "Opel",
+    "Peugeot",
+    "Porsche",
+    "RAM",
+    "Renault",
+    "Seat",
+    "Skoda",
+    "SsangYong",
+    "Subaru",
+    "Suzuki",
+    "Toyota",
+    "Volkswagen",
+    "Volvo",
+}
+BANNED_OPTION_TOKENS = {
+    "camiseta",
+    "camisa",
+    "chaqueta",
+    "blusa",
+    "jean",
+    "jeans",
+    "sudadera",
+    "gorra",
+    "tenis",
+    "zapato",
+    "zapatilla",
+    "pantalon",
+    "bolso",
+    "reloj",
+    "perfume",
+    "celular",
+    "iphone",
+    "samsung",
+    "cargador",
+    "funda",
+    "licra",
+}
+
 
 def _normalize_text(value: str | None) -> str | None:
     return value.strip().lower() if value else None
+
+
+def _is_reasonable_facet_value(value: str | int | bool, *, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return True
+    if isinstance(value, int):
+        return 1950 <= value <= 2100 if field_name == "year" else True
+
+    normalized = str(value).strip()
+    if not normalized:
+        return False
+
+    lowered = normalized.lower()
+    if any(token in lowered for token in BANNED_OPTION_TOKENS):
+        return False
+
+    if field_name == "brand":
+        return normalized in KNOWN_BRANDS
+    if field_name == "transmission":
+        return lowered in {"automatica", "manual", "cvt", "mecanica", "mecanico", "automatizada"}
+    if field_name == "fuel_type":
+        return lowered in {"gasolina", "diesel", "hibrido", "electrico", "gnv", "gas"}
+    if len(normalized) > 45:
+        return False
+    return any(char.isalnum() for char in normalized)
 
 
 def _latest_listing_media_subquery():
@@ -173,6 +268,7 @@ def _facet_options(
     filters: MarketSearchFilters,
     column,
     *,
+    field_name: str,
     limit: int = 25,
     descending: bool = False,
 ) -> list[FilterOption]:
@@ -190,20 +286,25 @@ def _facet_options(
         stmt = stmt.order_by(func.count().desc(), column.asc())
 
     rows = db.execute(stmt.limit(limit)).all()
-    return [FilterOption(value=row.value, count=row.count) for row in rows]
+    options: list[FilterOption] = []
+    for row in rows:
+        if not _is_reasonable_facet_value(row.value, field_name=field_name):
+            continue
+        options.append(FilterOption(value=row.value, count=row.count))
+    return options
 
 
 def get_market_filters(db: Session, filters: MarketSearchFilters) -> MarketFiltersResponse:
     return MarketFiltersResponse(
-        brands=_facet_options(db, filters, ListingModel.brand_std),
-        models=_facet_options(db, filters, ListingModel.model_std),
-        trims=_facet_options(db, filters, ListingModel.trim_std),
-        departments=_facet_options(db, filters, ListingModel.department_std),
-        municipalities=_facet_options(db, filters, ListingModel.municipality_std),
-        localities=_facet_options(db, filters, ListingModel.locality_std),
-        fuel_types=_facet_options(db, filters, ListingModel.fuel_type_std),
-        transmissions=_facet_options(db, filters, ListingModel.transmission_std),
-        years=_facet_options(db, filters, ListingModel.year, descending=True),
+        brands=_facet_options(db, filters, ListingModel.brand_std, field_name="brand"),
+        models=_facet_options(db, filters, ListingModel.model_std, field_name="model"),
+        trims=_facet_options(db, filters, ListingModel.trim_std, field_name="trim"),
+        departments=_facet_options(db, filters, ListingModel.department_std, field_name="department"),
+        municipalities=_facet_options(db, filters, ListingModel.municipality_std, field_name="municipality"),
+        localities=_facet_options(db, filters, ListingModel.locality_std, field_name="locality"),
+        fuel_types=_facet_options(db, filters, ListingModel.fuel_type_std, field_name="fuel_type"),
+        transmissions=_facet_options(db, filters, ListingModel.transmission_std, field_name="transmission"),
+        years=_facet_options(db, filters, ListingModel.year, field_name="year", descending=True),
     )
 
 

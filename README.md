@@ -1,105 +1,86 @@
-# Estimador de Precio de Venta de Vehiculos Usados
+# Estimador de Precio de Mercado de Vehiculos Usados
 
-Base ejecutable de la Fase 1 del proyecto para estimar precios observables de mercado de vehiculos usados en Colombia usando exclusivamente Mercado Libre Colombia.
+Aplicacion analitica end-to-end para estimar precios observables de mercado de vehiculos usados en Colombia usando exclusivamente anuncios de Mercado Libre Colombia.
 
-El proyecto queda ahora preparado para usar `Supabase Postgres` como ruta principal de desarrollo cuando Docker no esta disponible.
+El sistema combina:
 
-## Que incluye esta fase
+- captura y versionado de inventario de mercado
+- normalizacion y enriquecimiento geografico
+- modelos de machine learning para estimacion de precio
+- API en FastAPI para exploracion y prediccion
+- frontend MVP en Streamlit para explorador de mercado y estimador
 
-- Estructura modular del repositorio.
-- Configuracion base en Python con `pyproject.toml`.
-- API inicial con `FastAPI`.
-- Conexion a Postgres optimizada para Supabase.
-- Modelos ORM iniciales con SQLAlchemy 2.0.
-- Scripts base para inicializar base de datos y extraccion.
-- `docker-compose` para correr API + Postgres local.
+La documentacion de arquitectura, roadmap y diseno por fases vive en `docs/`.
 
-## Arranque recomendado con Supabase
+## Que hace hoy el proyecto
 
-1. Crea un proyecto en Supabase.
-2. Ve a `Project Settings > Database`.
-3. Copia la cadena de conexion Postgres directa del proyecto.
-4. Crea tu `.env`:
+Actualmente el desarrollo ya permite:
 
-```powershell
-Copy-Item .env.example .env
-```
+- extraer anuncios desde Mercado Libre Colombia con estrategia resiliente
+- guardar evidencia raw de cada corrida
+- procesar anuncios desde `raw` hasta `staging` y `core`
+- mantener historico de precios y estado del anuncio
+- consultar inventario capturado por marca, modelo, ubicacion, ano, kilometraje y mas
+- entrenar modelos de pricing para alcance global y para marcas mainstream
+- servir predicciones por API con rango, confianza, comparables y explicabilidad
+- consumir esa API desde un frontend MVP en Streamlit
 
-5. Edita `.env` y reemplaza:
+## Fuente de datos
 
-```env
-DATABASE_URL=postgresql+psycopg://postgres:[YOUR_PASSWORD]@[YOUR_SUPABASE_HOST]:5432/postgres
-DATABASE_SSL_MODE=require
-```
+La fuente unica y obligatoria es Mercado Libre Colombia.
 
-6. Instala dependencias:
+La extraccion sigue esta estrategia:
 
-```powershell
-python -m pip install -e .[dev]
-```
+1. intenta API publica o endpoints accesibles
+2. si hay bloqueo o `403`, usa fallback web
+3. si la pagina requiere JavaScript, usa navegador automatizado con Playwright
+4. guarda siempre evidencia raw y metadatos de extraccion
 
-7. Verifica conexion:
+## Arquitectura resumida
 
-```powershell
-python scripts/check_db_connection.py
-```
+Capas principales:
 
-8. Crea schemas y tablas:
+- `domain`: entidades y contratos de negocio
+- `application`: servicios y casos de uso
+- `infrastructure`: base de datos, conectores, ML serving, almacenamiento
+- `pipelines`: extraccion, procesamiento, entrenamiento y monitoreo
+- `api`: endpoints FastAPI
+- `frontend`: app Streamlit
 
-```powershell
-python scripts/init_db.py
-```
+Persistencia:
 
-9. Ejecuta la API:
+- `raw`: payloads originales y corridas de extraccion
+- `staging`: anuncios parseados para normalizacion
+- `core`: inventario limpio, historico, features y comparables
+- `ml`: registro de modelos y artefactos
+- `ops`: ejecuciones y auditoria operativa
 
-```powershell
-python -m uvicorn vehicle_price_estimator.api.main:app --reload
-```
+## Modelos de prediccion
 
-La API quedara disponible en [http://localhost:8000/docs](http://localhost:8000/docs).
+Hoy el serving usa dos alcances:
 
-## Arranque local alternativo con Docker
+- `mainstream`: para `Toyota`, `Mazda`, `Renault`, `Chevrolet`, `Volkswagen`
+- `global`: fallback para cualquier otra marca o segmento con menor cobertura
 
-Usa esta ruta solo si tu equipo soporta virtualizacion y Docker Desktop funciona correctamente.
+Consideraciones de negocio:
 
-1. Crear archivo de entorno:
+- las predicciones `mainstream` son las mas fuertes y estables del sistema
+- las predicciones para vehiculos no mainstream dependen del modelo `global`
+- el modelo `global` es util como referencia inicial de mercado, pero hoy tiene menor precision y debe leerse con mas cautela
+- para vehiculos no mainstream conviene apoyar la salida del modelo con comparables observables y criterio humano
 
-```powershell
-Copy-Item .env.example .env
-```
+La respuesta de prediccion incluye:
 
-2. Ajusta `.env` para usar Postgres local:
+- precio estimado
+- rango estimado
+- score y etiqueta de confianza
+- modelo y scope usados
+- comparables
+- explicabilidad local o resumen SHAP del modelo
 
-```env
-DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/vehicle_price_estimator
-DATABASE_SSL_MODE=disable
-```
+## API disponible
 
-3. Instalar dependencias:
-
-```powershell
-python -m pip install -e .[dev]
-```
-
-4. Levantar Postgres local:
-
-```powershell
-docker compose up -d postgres
-```
-
-5. Crear schemas y tablas:
-
-```powershell
-python scripts/init_db.py
-```
-
-6. Ejecutar la API:
-
-```powershell
-uvicorn vehicle_price_estimator.api.main:app --reload
-```
-
-## Endpoints iniciales
+Endpoints principales:
 
 - `GET /health`
 - `GET /api/v1/health/db`
@@ -112,320 +93,160 @@ uvicorn vehicle_price_estimator.api.main:app --reload
 - `GET /api/v1/predictions/models/active`
 - `POST /api/v1/predictions/estimate`
 
-## Scripts disponibles
+Swagger:
 
-- `python scripts/init_db.py`
-- `python scripts/check_db_connection.py`
-- `python scripts/extract_marketplace.py`
-- `python scripts/run_inventory_capture.py --dry-run`
-- `python scripts/run_inventory_capture.py --campaign discovery --brands toyota,mazda,chevrolet --regions bogota,medellin,cali`
-- `python scripts/train_models.py`
-- `python scripts/promote_model.py --registry-id TU_UUID`
-- `python scripts/promote_model.py --latest-scope global`
-- `python scripts/promote_model.py --latest-scope mainstream`
+- [http://localhost:8000/docs](http://localhost:8000/docs)
 
-## Extraccion inicial Mercado Libre Colombia
+## Frontend MVP
 
-El conector actual usa esta estrategia:
+El frontend MVP en Streamlit tiene dos modulos:
 
-1. intenta la API publica de busqueda de Mercado Libre
-2. si la API responde `403` u otro estado no exitoso, intenta una busqueda web fallback
-3. si la web simple devuelve un challenge JavaScript, intenta un fallback con navegador real usando Playwright
-4. guarda siempre evidencia raw de la corrida en `data/raw`
-5. registra cada payload tambien en la tabla `raw.listing_payloads`
+- explorador de mercado
+- estimador de precio
 
-Para habilitar el fallback con navegador real por primera vez:
+En el explorador puedes:
+
+- filtrar inventario capturado
+- revisar distribucion de precios
+- inspeccionar anuncios capturados
+
+En el estimador puedes:
+
+- ingresar caracteristicas del vehiculo
+- obtener precio estimado y rango
+- ver confianza y comparables
+- revisar variables influyentes
+
+El explorador ahora incluye:
+
+- panorama del segmento con distribucion y ranking visible de marcas/modelos
+- geografia interactiva con mapa por volumen o precio mediano
+- inventario filtrable por zona desde la tabla geografica
+
+## Ejecucion local con Supabase
+
+Ruta recomendada cuando no usas Docker.
+
+1. Crea `.env`:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+2. Configura la conexion Postgres de Supabase:
+
+```env
+DATABASE_URL=postgresql+psycopg://postgres:[YOUR_PASSWORD]@[YOUR_SUPABASE_HOST]:5432/postgres
+DATABASE_SSL_MODE=require
+```
+
+3. Instala dependencias:
 
 ```powershell
 python -m pip install -e .[dev]
-python -m playwright install chromium
 ```
 
-Ejemplo:
+4. Inicializa base:
 
 ```powershell
-python scripts/extract_marketplace.py --query "mazda 3 bogota" --limit 10
+python scripts/check_db_connection.py
+python scripts/init_db.py
 ```
 
-Opcional, para evitar pedir detalle por item:
-
-```powershell
-python scripts/extract_marketplace.py --query "renault sandero" --limit 10 --no-details
-```
-
-## Procesamiento raw a staging
-
-Una vez tengas una corrida raw con `browser_search` o `web_search`, puedes generar la tabla staging:
-
-```powershell
-python scripts/process_raw_to_staging.py
-```
-
-Tambien puedes procesar una corrida especifica:
-
-```powershell
-python scripts/process_raw_to_staging.py --extract-run-id TU_EXTRACT_RUN_ID
-```
-
-El pipeline actual de staging parsea desde el HTML renderizado de busqueda:
-
-- `source_listing_id`
-- `source_url`
-- `title_raw`
-- `price_amount`
-- `location_raw`
-- `city_raw`
-- `state_raw`
-- `brand_raw`
-- `model_raw`
-- `version_raw`
-- `year_raw`
-- `mileage_raw`
-- `image_url`
-
-## Procesamiento staging a core
-
-El siguiente paso normaliza staging y construye entidades de negocio en `core`:
-
-```powershell
-python scripts/process_staging_to_processed.py
-```
-
-Tambien puedes procesar una corrida especifica:
-
-```powershell
-python scripts/process_staging_to_processed.py --extract-run-id TU_EXTRACT_RUN_ID
-```
-
-El pipeline actual crea o actualiza:
-
-- `core.vehicle_canonical`
-- `core.listings`
-- `core.listing_price_history`
-- `core.listing_status_history`
-- `core.listing_features`
-
-Incluye en esta primera version:
-
-- normalizacion basica de marca, modelo, version y ubicacion
-- deduplicacion por `source_name + source_listing_id`
-- historico de precios por observacion
-- historico de estado `active`
-- features iniciales:
-  - `vehicle_age`
-  - `km_per_year`
-  - `equipment_score`
-  - `version_rarity_score`
-  - `regional_market_score`
-  - `listing_age_days`
-  - `comparable_inventory_density`
-  - `outlier_flag` basico por IQR de segmento
-
-Refinamientos actuales de normalizacion en `core.listings` y `core.vehicle_canonical`:
-
-- `trim_std`
-- `engine_displacement_std`
-- `engine_cc`
-- `hybrid_flag`
-- `mhev_flag`
-- `variant_raw`
-- `marketing_tokens_json`
-
-Esto permite separar mejor:
-
-- `Touring`, `Grand Touring`, `Prime`, `Sport`, `LX` como trim
-- `2.0`, `1.6`, `2000cc` como motor
-- `AT`, `MT`, `Mecanico`, `Automatica` como transmision
-- `Hibrido` y `MHEV` como flags estructurados
-
-## Construccion de inventario amplio
-
-Antes del entrenamiento conviene ampliar el inventario con una campana nacional orientada a marcas, regiones y modelos descubiertos en Mercado Libre Colombia.
-
-Cobertura por defecto de la campana:
-
-- marcas: `Toyota`, `Mazda`, `Chevrolet`, `Volkswagen`, `Renault`, `BYD`, `Kia`, `Mercedes-Benz`, `BMW`, `Audi`, `Nissan`
-- hubs regionales: `Bogota`, `Medellin`, `Cali`, `Barranquilla`, `Cartagena`, `Bucaramanga`, `Cucuta`, `Pereira`, `Villavicencio`, `Pasto`
-- anos ancla para backfill: `2010`, `2014`, `2018`, `2022` y el ano actual
-
-Campanas disponibles:
-
-- `discovery`: consulta `marca + region` para descubrir modelos presentes en Mercado Libre
-- `model_region`: consulta `marca + modelo + region` usando modelos ya descubiertos en la base
-- `year_backfill`: consulta `marca + ano + region` para reforzar cobertura desde 2010
-- `full`: combina discovery, model_region y year_backfill
-
-Ejemplos:
-
-```powershell
-python scripts/run_inventory_capture.py --campaign discovery --dry-run
-```
-
-```powershell
-python scripts/run_inventory_capture.py --campaign discovery --brands toyota,mazda,chevrolet --regions bogota,medellin,cali --max-queries 12
-```
-
-```powershell
-python scripts/run_inventory_capture.py --campaign model_region --brands toyota,mazda --regions bogota,cali --max-models-per-brand 8
-```
-
-```powershell
-python scripts/run_inventory_capture.py --campaign year_backfill --brands renault,kia,nissan --regions bogota,medellin,cali --max-queries 20
-```
-
-Recomendacion operativa para presupuesto bajo:
-
-1. Ejecuta primero `discovery` por lotes pequenos.
-2. Revisa `/api/v1/market/filters` o `core.listings` para validar cobertura de marcas/modelos.
-3. Ejecuta `model_region` para profundizar marcas/modelos ya observados.
-4. Ejecuta `year_backfill` para reforzar cobertura 2010+ antes del entrenamiento.
-
-## Entrenamiento inicial
-
-La primera version de la Fase 5 ya entrena y compara varios candidatos sobre `core.listings` + `core.listing_features`.
-
-Incluye:
-
-- `ElasticNet` como baseline lineal
-- `RandomForestRegressor`
-- `HistGradientBoostingRegressor` como booster tabular liviano
-- `CatBoost`, `LightGBM` y `XGBoost` si estan instalados en el entorno
-
-El pipeline:
-
-1. construye un dataset reproducible en `data/artifacts/training/datasets`
-2. hace split temporal 80/20 usando `first_seen_at` y `updated_at`
-3. entrena candidatos con target `log1p(price_cop)`
-4. calcula `MAE`, `RMSE`, `MAPE` y `R2`
-5. registra cada candidato en `ml.model_registry`
-6. promueve automaticamente el mejor solo si mejora al modelo activo
-
-Ejecutar:
-
-```powershell
-python -m pip install -e .[dev]
-python scripts/train_models.py
-```
-
-Si quieres incluir outliers o anuncios inactivos:
-
-```powershell
-python scripts/train_models.py --include-outliers --include-inactive
-```
-
-Para entrenar el modelo segmentado mainstream:
-
-```powershell
-python scripts/train_models.py --brands Toyota,Mazda,Renault,Chevrolet,Volkswagen --min-model-rows 15 --no-promote
-```
-
-Para promover el mejor global y el mejor mainstream por separado:
-
-```powershell
-python scripts/promote_model.py --latest-scope global
-python scripts/promote_model.py --latest-scope mainstream
-```
-
-## Serving y prediccion
-
-La Fase 6 agrega una capa de serving con doble modelo:
-
-- `global`: fallback para cualquier marca con cobertura limitada
-- `mainstream`: preferido para `Toyota`, `Mazda`, `Renault`, `Chevrolet`, `Volkswagen`
-
-Importante:
-
-- las predicciones `mainstream` son hoy las mas fuertes del sistema
-- las predicciones para marcas no mainstream dependen del modelo `global`
-- ese fallback sigue siendo util para estimacion inicial, pero actualmente tiene menor precision, menor robustez segmental y debe interpretarse con mayor cautela
-- para vehiculos no mainstream, la recomendacion es usar la prediccion como referencia preliminar y apoyarla con comparables observables y criterio humano
-
-El router de prediccion usa la marca para decidir el scope solicitado y luego:
-
-1. intenta usar el modelo activo del scope correcto
-2. si no existe, usa el ultimo modelo registrado de ese scope
-3. si el scope solicitado es `mainstream` y no hay modelo disponible, cae a `global`
-
-Ejemplos:
+5. Levanta la API:
 
 ```powershell
 python -m uvicorn vehicle_price_estimator.api.main:app --reload
 ```
 
-Consultar modelos activos:
-
-```text
-GET /api/v1/predictions/models/active
-```
-
-Estimar precio:
-
-```text
-POST /api/v1/predictions/estimate
-```
-
-Payload ejemplo:
-
-```json
-{
-  "brand_std": "Toyota",
-  "model_std": "Corolla Cross",
-  "trim_std": "XEI",
-  "year": 2022,
-  "mileage_km": 42000,
-  "engine_displacement_std": "2.0",
-  "transmission_std": "Automatica",
-  "fuel_type_std": "Hibrido",
-  "department_std": "Bogotá D.C.",
-  "municipality_std": "Bogota D.C.",
-  "locality_std": "Suba",
-  "hybrid_flag": true,
-  "mhev_flag": false
-}
-```
-
-La respuesta incluye:
-
-- precio estimado en COP
-- rango estimado
-- score y etiqueta de confianza
-- modelo usado y scope efectivo
-- comparables
-- explicacion SHAP local si el modelo lo soporta
-- una lectura mas cauta cuando la prediccion cae en el modelo global para marcas no mainstream
-
-## Frontend MVP en Streamlit
-
-La Fase 7 incorpora un frontend MVP en Streamlit con dos modulos:
-
-- explorador de mercado
-- estimador de precio
-
-Ejecutar:
+6. Levanta el frontend:
 
 ```powershell
 streamlit run src/vehicle_price_estimator/frontend/streamlit_app/Home.py
 ```
 
-Por defecto intenta conectarse a:
+Por defecto Streamlit apunta a:
 
 ```text
 http://localhost:8000/api/v1
 ```
 
-Recomendacion operativa:
+Tambien puedes definirla por entorno:
 
-1. inicia la API con `uvicorn`
-2. inicia Streamlit en otra terminal
-3. usa el explorador para revisar inventario y el estimador para predicciones puntuales
-4. para marcas no mainstream, interpreta la salida como referencia inicial de mercado y no como estimacion de alta confianza
+```env
+STREAMLIT_API_BASE_URL=http://localhost:8000/api/v1
+```
 
-## Nota sobre Supabase
+## Flujo operativo tipico
+
+1. extraer inventario
+2. procesar `raw -> staging`
+3. procesar `staging -> core`
+4. entrenar o reentrenar modelos
+5. promover modelos por scope
+6. consumir la API y el frontend
+
+## Scripts utiles
+
+Base de datos:
+
+- `python scripts/init_db.py`
+- `python scripts/check_db_connection.py`
+
+Extraccion y procesamiento:
+
+- `python scripts/extract_marketplace.py --query "mazda 3 bogota" --limit 10`
+- `python scripts/process_raw_to_staging.py`
+- `python scripts/process_staging_to_processed.py`
+- `python scripts/run_inventory_capture.py --dry-run`
+
+Entrenamiento:
+
+- `python scripts/train_models.py`
+- `python scripts/train_models.py --min-model-rows 15 --no-promote`
+- `python scripts/train_models.py --brands Toyota,Mazda,Renault,Chevrolet,Volkswagen --min-model-rows 15 --no-promote`
+
+Promocion:
+
+- `python scripts/promote_model.py --latest-scope global`
+- `python scripts/promote_model.py --latest-scope mainstream`
+- `python scripts/promote_model.py --registry-id TU_UUID --force`
+
+## Docker
+
+Docker es opcional. Si tu equipo no tiene virtualizacion habilitada, puedes trabajar sin problema con Supabase como base remota.
+
+## Despliegue MVP
+
+Ruta recomendada de costo bajo:
+
+- backend API en Render
+- base de datos en Supabase
+- frontend en Streamlit Community Cloud o contenedor ligero
+
+Archivos incluidos:
+
+- `render.yaml`
+- `infra/docker/Dockerfile.api`
+- `infra/docker/Dockerfile.streamlit`
+- `.github/workflows/ci.yml`
+- `docs/deployment.md`
+
+Entrada sugerida del frontend desplegado:
+
+```bash
+streamlit run streamlit_app.py
+```
+
+Variable importante para el frontend:
+
+```env
+STREAMLIT_API_BASE_URL=https://TU_BACKEND/api/v1
+```
+
+## Notas
 
 - Usa la conexion directa Postgres, no la URL de la API REST.
-- Mantén `DATABASE_SSL_MODE=require`.
-- El endpoint `GET /api/v1/meta/settings` devuelve la URL enmascarada para confirmar que la configuracion cargó bien.
-
-## Docker es opcional
-
-Si tu equipo no tiene virtualizacion habilitada, puedes trabajar normalmente con Supabase y ejecutar toda esta fase sin Docker.
+- Manten `DATABASE_SSL_MODE=require`.
+- Usa `python -m playwright install chromium` para habilitar el fallback con navegador en la extraccion.
+- Para mas detalle de arquitectura, decisiones, roadmap y despliegue, revisa la carpeta `docs/`.
